@@ -1,0 +1,78 @@
+project:
+  name: geoleaklens
+  seed: 42
+  output_dir: outputs
+
+data:
+  manifest_path: data/processed/manifests/gsv_mvp.parquet
+  image_root: data/interim/stripped_exif
+  cache_dir: data/processed
+  max_image_side: 1024
+  strip_exif: true
+
+evaluation:
+  thresholds_km: [1, 25, 200, 750, 2500]
+  main_threshold_km: 25
+  n_bootstrap: 1000
+  bootstrap_seed: 123
+  include_only_original_success_for_causal_region_analysis: true
+  include_all_images_for_final_redaction_eval: true
+
+segmentation:
+  engine: sam2
+  sam_checkpoint: null
+  min_area_frac: 0.001
+  max_area_frac: 0.45
+  dedup_iou_threshold: 0.85
+  mask_dilation_px: 5
+  add_grid_regions: true
+  grid_sizes: [4, 8]
+  add_ocr_regions: true
+  add_object_regions: true
+
+interventions:
+  types: ["blur", "mean_mask", "inpaint"]
+  primary_type: "mean_mask"
+  headline_intervention: "min_across_types"
+  blur_sigma_frac: 0.035
+  mean_mask_use_local_color: true
+  inpaint_engine: lama
+  mask_dilation_px: 7
+
+models:
+  geolocation_adversaries:
+    - name: geoclip
+      type: local
+      enabled: true
+    - name: gpt4o
+      type: api
+      enabled: false
+    - name: gemini
+      type: api
+      enabled: false
+    - name: qwen_vl
+      type: open_vlm
+      enabled: false
+
+  utility:
+    clip_model: ViT-L-14
+    clip_pretrained: openai
+    caption_model: Salesforce/blip-image-captioning-base
+    aesthetic_model: null
+
+redaction:
+  budgets_area_frac: [0.01, 0.02, 0.05, 0.1, 0.15, 0.2]
+  utility_clip_min: 0.85
+  score_normalization: leakage_per_area
+  pareto_score_normalization: leakage_per_utility_cost
+  greedy_recompute: true
+  random_baseline_repeats: 10
+  primary_metric: median_error_increase_km
+  conditioning:
+    region_analysis: original_success_at_25km
+    final_redaction_eval: all_images
+
+logging:
+  level: INFO
+  save_intermediate_images: true
+  save_api_raw_responses: true

@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.venv/
+venv/
+
+# Data and outputs (large + reproducible)
+data/raw/
+data/interim/
+data/processed/
+data/external/
+outputs/figures/
+outputs/tables/
+outputs/logs/
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
