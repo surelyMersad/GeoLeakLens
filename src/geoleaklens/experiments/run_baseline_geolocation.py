@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterable, Optional
@@ -39,8 +40,17 @@ from typing import Iterable, Optional
 import numpy as np
 import pandas as pd
 
+# Load .env so OPENAI_API_KEY is picked up without the user having to
+# `export` it in their shell. .env is gitignored — never commit secrets.
+try:
+    from dotenv import load_dotenv  # type: ignore
+    load_dotenv()
+except ImportError:
+    pass
+
 from geoleaklens.modal_app import GeoCLIPModal, app
 from geoleaklens.models.qwen_modal import QwenVLModal  # noqa: F401  (registers cls)
+from geoleaklens.models.openai_wrapper import OpenAIVLMWrapper
 from geoleaklens.scoring.parse_predictions import parse_geolocation_response
 from geoleaklens.scoring.geolocation_metrics import (
     DEFAULT_THRESHOLDS_KM,
@@ -163,6 +173,62 @@ def _run_geoclip(
     return cached
 
 
+def _run_openai(
+    df: pd.DataFrame,
+    out_jsonl: Path,
+    wrapper: OpenAIVLMWrapper,
+    *,
+    run_id: str,
+    resume: bool,
+) -> dict[str, dict]:
+    """Mirror of `_run_qwen`, but for the closed OpenAI API.
+
+    Caching is layered: the wrapper has its own per-call disk cache (§8.6
+    keyed by image_sha256+prompt), and this function additionally skips
+    images already in the JSONL when --resume. The two are complementary —
+    the wrapper cache survives even if you `rm` the JSONL.
+    """
+    cached = _read_existing_jsonl(out_jsonl) if resume else {}
+    out_jsonl.parent.mkdir(parents=True, exist_ok=True)
+    mode = "a" if resume and cached else "w"
+    with open(out_jsonl, mode) as f:
+        for i, row in df.iterrows():
+            image_id = row["image_id"]
+            if image_id in cached:
+                continue
+            image_path = Path(row["image_path"])
+            if not image_path.exists():
+                print(f"[skip-openai] missing image: {image_path}")
+                continue
+            with open(image_path, "rb") as ip:
+                img_bytes = ip.read()
+            raw = wrapper.predict(
+                image_bytes=img_bytes,
+                prompt=GEO_NEUTRAL_V1,
+                prompt_id="geo_neutral_v1",
+            )
+            parsed = parse_geolocation_response(raw["raw_response"])
+            entry = {
+                "run_id": run_id,
+                "image_id": image_id,
+                "model_name": wrapper.name,
+                "model_type": "closed_api",
+                "prompt_id": "geo_neutral_v1",
+                "raw_response": parsed["raw_response"],
+                "parsed": parsed["parsed"],
+                "parse_success": parsed["parse_success"],
+                "cache_hit": bool(raw.get("cache_hit", False)),
+                "created_at": _now_iso(),
+                "error": parsed["error"] or raw.get("error"),
+            }
+            f.write(json.dumps(entry) + "\n")
+            f.flush()
+            cached[image_id] = entry
+            if (i + 1) % 10 == 0:
+                print(f"[openai] {i + 1}/{len(df)} done")
+    return cached
+
+
 def _run_qwen(
     df: pd.DataFrame,
     out_jsonl: Path,
@@ -258,52 +324,79 @@ def run(
     dataset_label: str,
     geoclip_jsonl: Path,
     qwen_jsonl: Path,
+    openai_jsonl: Path,
     table_path: Path,
     vlm_subset_n: int,
     vlm_subset_seed: int,
     max_images: Optional[int],
-    skip_vlm: bool,
+    vlm_backend: str,  # "none" | "qwen" | "gpt-4o" | "both"
+    openai_model: str,
+    skip_geoclip: bool,
     resume: bool,
     run_id: str,
 ) -> dict:
     df = pd.read_parquet(manifest_path)
     if max_images:
         df = df.head(max_images).reset_index(drop=True)
-    print(f"[run] dataset={dataset_label}  n_images={len(df)}  vlm_subset_n={vlm_subset_n}")
+    print(
+        f"[run] dataset={dataset_label}  n_images={len(df)}  "
+        f"vlm_backend={vlm_backend}  vlm_subset_n={vlm_subset_n}"
+    )
 
+    use_qwen = vlm_backend in ("qwen", "both")
+    use_openai = vlm_backend in ("gpt-4o", "both")
     df_subset = (
         _stratified_or_random_subsample(df, vlm_subset_n, vlm_subset_seed)
-        if not skip_vlm
+        if (use_qwen or use_openai)
         else pd.DataFrame()
     )
 
     table_path.parent.mkdir(parents=True, exist_ok=True)
 
-    with app.run():
-        geoclip = GeoCLIPModal()
-        geoclip_preds = _run_geoclip(
-            df, geoclip_jsonl, geoclip, run_id=run_id, resume=resume
-        )
+    geoclip_preds: dict[str, dict] = {}
+    qwen_preds: dict[str, dict] = {}
+    openai_preds: dict[str, dict] = {}
 
-        qwen_preds: dict[str, dict] = {}
-        if not skip_vlm and len(df_subset) > 0:
-            qwen = QwenVLModal()
-            qwen_preds = _run_qwen(
-                df_subset, qwen_jsonl, qwen, run_id=run_id, resume=resume
-            )
+    # Modal app context only entered when we actually need a Modal cls.
+    needs_modal = (not skip_geoclip) or use_qwen
+    if needs_modal:
+        with app.run():
+            if not skip_geoclip:
+                geoclip = GeoCLIPModal()
+                geoclip_preds = _run_geoclip(
+                    df, geoclip_jsonl, geoclip, run_id=run_id, resume=resume
+                )
+            if use_qwen and len(df_subset) > 0:
+                qwen = QwenVLModal()
+                qwen_preds = _run_qwen(
+                    df_subset, qwen_jsonl, qwen, run_id=run_id, resume=resume
+                )
+    elif not skip_geoclip:
+        # `not needs_modal` and `not skip_geoclip` shouldn't both hold; this
+        # branch is unreachable, but keeps the static-analysis-friendly shape.
+        pass
+
+    # OpenAI runs locally (no Modal) — cheaper to keep its loop outside the
+    # `with app.run():` context so cold-start is not gated on Modal liveness.
+    if use_openai and len(df_subset) > 0:
+        wrapper = OpenAIVLMWrapper(model=openai_model)
+        openai_preds = _run_openai(
+            df_subset, openai_jsonl, wrapper, run_id=run_id, resume=resume
+        )
 
     rows: list[dict] = []
-    rows.append(
-        _aggregate_to_table_row(
-            model_name="geoclip",
-            dataset=dataset_label,
-            prompt_id=None,
-            n_images=len(df),
-            df_eval=df,
-            preds_by_id=geoclip_preds,
+    if not skip_geoclip:
+        rows.append(
+            _aggregate_to_table_row(
+                model_name="geoclip",
+                dataset=dataset_label,
+                prompt_id=None,
+                n_images=len(df),
+                df_eval=df,
+                preds_by_id=geoclip_preds,
+            )
         )
-    )
-    if not skip_vlm and len(df_subset) > 0:
+    if use_qwen and len(df_subset) > 0:
         rows.append(
             _aggregate_to_table_row(
                 model_name="qwen2.5-vl-7b",
@@ -312,6 +405,17 @@ def run(
                 n_images=len(df_subset),
                 df_eval=df_subset,
                 preds_by_id=qwen_preds,
+            )
+        )
+    if use_openai and len(df_subset) > 0:
+        rows.append(
+            _aggregate_to_table_row(
+                model_name=openai_model,
+                dataset=dataset_label,
+                prompt_id="geo_neutral_v1",
+                n_images=len(df_subset),
+                df_eval=df_subset,
+                preds_by_id=openai_preds,
             )
         )
 
@@ -340,6 +444,7 @@ def run(
     return {
         "n_geoclip": len(geoclip_preds),
         "n_qwen": len(qwen_preds),
+        "n_openai": len(openai_preds),
         "table": str(table_path),
     }
 
@@ -364,6 +469,10 @@ def main() -> None:
         default="data/processed/predictions/qwen-vl/E1_im2gps3k_subset.jsonl",
     )
     ap.add_argument(
+        "--openai-jsonl",
+        default="data/processed/predictions/openai/E1_im2gps3k_subset.jsonl",
+    )
+    ap.add_argument(
         "--table",
         default="outputs/tables/baseline_geolocation.csv",
     )
@@ -376,9 +485,23 @@ def main() -> None:
         help="Cap GeoCLIP eval at this many manifest rows (smoke testing).",
     )
     ap.add_argument(
-        "--no-vlm",
+        "--vlm-backend",
+        choices=["none", "qwen", "gpt-4o", "both"],
+        default="qwen",
+        help="Which VLM(s) to run on the subset. 'gpt-4o' uses the OpenAI "
+        "API (needs OPENAI_API_KEY). 'both' runs Qwen on Modal AND GPT-4o "
+        "on the same subset.",
+    )
+    ap.add_argument(
+        "--openai-model",
+        default="gpt-4o",
+        help="OpenAI model id (e.g. gpt-4o, gpt-4o-mini, gpt-4.1).",
+    )
+    ap.add_argument(
+        "--skip-geoclip",
         action="store_true",
-        help="Skip the Qwen-VL subset (GeoCLIP-only run).",
+        help="Skip the GeoCLIP-on-full-N pass (e.g. when only updating the "
+        "VLM subset).",
     )
     ap.add_argument(
         "--resume",
@@ -393,11 +516,14 @@ def main() -> None:
         dataset_label=args.dataset_label,
         geoclip_jsonl=Path(args.geoclip_jsonl),
         qwen_jsonl=Path(args.qwen_jsonl),
+        openai_jsonl=Path(args.openai_jsonl),
         table_path=Path(args.table),
         vlm_subset_n=args.vlm_subset_n,
         vlm_subset_seed=args.vlm_subset_seed,
         max_images=args.max_images,
-        skip_vlm=args.no_vlm,
+        vlm_backend=args.vlm_backend,
+        openai_model=args.openai_model,
+        skip_geoclip=args.skip_geoclip,
         resume=args.resume,
         run_id=args.run_id,
     )

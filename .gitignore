@@ -20,3 +20,8 @@ outputs/logs/
 .idea/
 .vscode/
 .history/
+
+# Secrets
+.env
+.env.local
+.env.*.local
