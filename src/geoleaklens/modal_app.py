@@ -79,6 +79,25 @@ geoclip_image = (
     )
 )
 
+# Qwen2.5-VL needs a recent transformers (>= 4.49) which conflicts with the
+# geoclip pin above. Separate image keeps the two adversaries independent and
+# lets each cold-start without re-installing the other's dep tree.
+qwen_image = (
+    modal.Image.debian_slim(python_version=_PYTHON)
+    .pip_install(
+        "torch==2.4.1",
+        "torchvision==0.19.1",
+        extra_index_url="https://download.pytorch.org/whl/cu121",
+    )
+    .pip_install(
+        "transformers>=4.49.0,<5.0",
+        "accelerate>=0.30",
+        "qwen-vl-utils[decord]==0.0.8",
+        "pillow>=10",
+        "numpy>=1.24",
+    )
+)
+
 # ---- Volumes ----------------------------------------------------------------
 
 sam_checkpoints = modal.Volume.from_name(
