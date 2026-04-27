@@ -54,13 +54,47 @@ import pandas as pd
 from PIL import Image
 
 from geoleaklens.data.geo_utils import haversine_km, success_at
+from geoleaklens.interventions.blur import blur
+from geoleaklens.interventions.inpaint import inpaint
 from geoleaklens.interventions.mask import mean_mask
 from geoleaklens.modal_app import GeoCLIPModal, app
+from geoleaklens.models.inpaint_modal import LaMaModal
 from geoleaklens.redaction.baselines import LargestRegions, RandomRegions
 from geoleaklens.redaction.methods import StaticGreedy
-from geoleaklens.scoring.causal_scores import single_region_attribution
+from geoleaklens.scoring.causal_scores import (
+    DEFAULT_INTERVENTION_SET,
+    min_across_interventions,
+    single_region_attribution,
+)
 from geoleaklens.scoring.parse_predictions import parse_geolocation_response
 from geoleaklens.segmentation.sam_modal import SAMModal, decode_masks
+
+
+def _apply_intervention(
+    name: str,
+    pil_image: Image.Image,
+    mask: np.ndarray,
+    *,
+    lama_modal=None,
+) -> Image.Image:
+    """Dispatch on intervention name; matches §10 spec defaults.
+
+    `lama_modal` is required when `name == "inpaint"`. The other two run
+    locally with no Modal dep, so callers can pass None when only mean_mask
+    or blur are needed.
+    """
+    if name == "mean_mask":
+        edited, _ = mean_mask(pil_image, mask, mode="local")
+        return edited
+    if name == "blur":
+        edited, _ = blur(pil_image, mask)
+        return edited
+    if name == "inpaint":
+        if lama_modal is None:
+            raise ValueError("inpaint requested but lama_modal is None")
+        edited, _ = inpaint(pil_image, mask, lama_modal=lama_modal)
+        return edited
+    raise ValueError(f"unknown intervention type: {name!r}")
 
 
 REGION_COLUMNS = [
@@ -216,12 +250,26 @@ def _run_attribution_phase(
     regions: pd.DataFrame,
     geoclip: GeoCLIPModal,
     *,
+    intervention_types: list[str],
+    lama_modal=None,
     threshold_km: float,
     region_cap: int,
     pred_jsonl: Path,
 ) -> pd.DataFrame:
-    """Per-region single-attribution scores under mean_mask only."""
+    """Per-region single-attribution scores under each requested intervention.
+
+    Emits one row of the §7.5 schema per (image, region, intervention). The
+    caller can stitch in §10.7 `min_across` rows by passing the result through
+    `min_across_interventions(...)` once this phase completes.
+
+    `lama_modal` is required if `"inpaint"` is in `intervention_types` — the
+    inpaint wrapper sends `image_bytes` over the Modal boundary. mean_mask /
+    blur run locally with just NumPy/Pillow.
+    """
     pred_jsonl.parent.mkdir(parents=True, exist_ok=True)
+    if "inpaint" in intervention_types and lama_modal is None:
+        raise ValueError("inpaint requested but lama_modal is None")
+
     score_rows: list[dict] = []
     pred_fp = open(pred_jsonl, "w")
 
@@ -241,43 +289,61 @@ def _run_attribution_phase(
             orig_parsed = parse_geolocation_response(orig_pred)
             orig_lat = orig_parsed["parsed"].get("lat")
             orig_lon = orig_parsed["parsed"].get("lon")
-
             pil = Image.open(io.BytesIO(img_bytes)).convert("RGB")
 
-            # Score top-`region_cap` regions by area to keep cost bounded.
+            # Cap to top-K regions by area so total cost stays bounded —
+            # without this, 80 regions × 3 interventions × 30 images is
+            # 7200 GeoCLIP calls (~2 hours on L4).
             picked = sub.sort_values("area_frac", ascending=False).head(region_cap)
+
             for _, r in picked.iterrows():
                 mask = _load_mask_npz(Path(r["mask_path"]))
-                edited, _ = mean_mask(pil, mask, mode="local")
-                buf = io.BytesIO()
-                edited.save(buf, format="JPEG", quality=92)
-                edit_pred = geoclip.predict.remote(buf.getvalue())
-                edit_parsed = parse_geolocation_response(edit_pred)
-                pred_fp.write(json.dumps({
-                    "image_id": image_id,
-                    "image_variant_id": f"{r['region_id']}__mean_mask",
-                    "model_name": "geoclip",
-                    "raw_response": edit_parsed["raw_response"],
-                    "parsed": edit_parsed["parsed"],
-                    "parse_success": edit_parsed["parse_success"],
-                    "created_at": _now_iso(),
-                }) + "\n")
-                pred_fp.flush()
-                score_rows.append(single_region_attribution(
-                    image_id=image_id,
-                    region_id=r["region_id"],
-                    model_name="geoclip",
-                    intervention_type="mean_mask",
-                    threshold_km=threshold_km,
-                    true_lat=true_lat,
-                    true_lon=true_lon,
-                    orig_lat=orig_lat, orig_lon=orig_lon,
-                    edit_lat=edit_parsed["parsed"].get("lat"),
-                    edit_lon=edit_parsed["parsed"].get("lon"),
-                    area_frac=float(r["area_frac"]),
-                    method="static_greedy",
-                ))
-            print(f"[attribution] {image_id}: {len(picked)} regions ({i+1}/{len(df)})")
+                for intervention_type in intervention_types:
+                    try:
+                        edited = _apply_intervention(
+                            intervention_type, pil, mask, lama_modal=lama_modal
+                        )
+                    except Exception as e:
+                        # Don't kill the whole run for one bad region/intervention.
+                        # The §10.4 spec already calls inpaint failure-prone.
+                        print(
+                            f"[attr-skip] {r['region_id']} / {intervention_type}: "
+                            f"{type(e).__name__}: {e}"
+                        )
+                        continue
+                    buf = io.BytesIO()
+                    edited.save(buf, format="JPEG", quality=92)
+                    edit_pred = geoclip.predict.remote(buf.getvalue())
+                    edit_parsed = parse_geolocation_response(edit_pred)
+                    pred_fp.write(json.dumps({
+                        "image_id": image_id,
+                        "image_variant_id": f"{r['region_id']}__{intervention_type}",
+                        "model_name": "geoclip",
+                        "intervention_type": intervention_type,
+                        "raw_response": edit_parsed["raw_response"],
+                        "parsed": edit_parsed["parsed"],
+                        "parse_success": edit_parsed["parse_success"],
+                        "created_at": _now_iso(),
+                    }) + "\n")
+                    pred_fp.flush()
+                    score_rows.append(single_region_attribution(
+                        image_id=image_id,
+                        region_id=r["region_id"],
+                        model_name="geoclip",
+                        intervention_type=intervention_type,
+                        threshold_km=threshold_km,
+                        true_lat=true_lat,
+                        true_lon=true_lon,
+                        orig_lat=orig_lat, orig_lon=orig_lon,
+                        edit_lat=edit_parsed["parsed"].get("lat"),
+                        edit_lon=edit_parsed["parsed"].get("lon"),
+                        area_frac=float(r["area_frac"]),
+                        method="static_greedy",
+                    ))
+            print(
+                f"[attribution] {image_id}: {len(picked)} regions × "
+                f"{len(intervention_types)} interventions ({i+1}/{len(df)})"
+            )
     finally:
         pred_fp.close()
     return pd.DataFrame(score_rows)
@@ -443,6 +509,8 @@ def run(
     sam_max_regions: int,
     region_cap_for_attribution: int,
     budgets: list[float],
+    intervention_types: list[str],  # NEW — which interventions to score under
+    ranking_intervention_type: str,  # NEW — which scores StaticGreedy ranks by
     skip_sam: bool,
     skip_attribution: bool,
     skip_redaction: bool,
@@ -471,21 +539,42 @@ def run(
         scores = pd.read_parquet(scores_path)
         print(f"[attribution] reusing {len(scores)} score rows from {scores_path}")
     else:
+        needs_lama = "inpaint" in intervention_types
         with app.run():
             geoclip = GeoCLIPModal()
+            lama_modal = LaMaModal() if needs_lama else None
             scores = _run_attribution_phase(
                 df, regions, geoclip,
+                intervention_types=intervention_types,
+                lama_modal=lama_modal,
                 threshold_km=threshold_km,
                 region_cap=region_cap_for_attribution,
                 pred_jsonl=pred_attribution_jsonl,
             )
+
+        # §10.7 — materialize min_across rows alongside the per-intervention
+        # rows. Static/dynamic greedy can then filter by intervention_type
+        # to switch between the conservative headline and per-intervention
+        # diagnostics without touching the runner.
+        if len(intervention_types) > 1:
+            min_rows = min_across_interventions(
+                scores, intervention_types=tuple(intervention_types)
+            )
+            if not min_rows.empty:
+                scores = pd.concat([scores, min_rows], ignore_index=True)
+                print(f"[min_across] added {len(min_rows)} aggregated rows")
+
         scores_path.parent.mkdir(parents=True, exist_ok=True)
         scores.to_parquet(scores_path, index=False)
         print(f"[attribution] wrote {scores_path} ({len(scores)} rows)")
 
     # --- 3. Redaction sweep -------------------------------------------
+    # StaticGreedy ranks by `ranking_intervention_type` (default "min_across").
+    # The baselines ignore scores entirely, so their intervention_type label
+    # is purely cosmetic — left at "mean_mask" because that's the §13.E2
+    # primary edit type per the spec.
     methods = [
-        StaticGreedy(intervention_type="mean_mask"),
+        StaticGreedy(intervention_type=ranking_intervention_type),
         LargestRegions(intervention_type="mean_mask"),
         RandomRegions(intervention_type="mean_mask", seed=seed),
     ]
@@ -571,6 +660,18 @@ def main() -> None:
         default="0.01,0.02,0.05,0.10,0.15,0.20",
         help="Comma-separated area-fraction budgets to sweep.",
     )
+    ap.add_argument(
+        "--intervention-types",
+        default=",".join(DEFAULT_INTERVENTION_SET),
+        help="Comma-separated interventions to score regions under "
+             "(e.g. mean_mask,blur,inpaint). 'inpaint' requires LaMa.",
+    )
+    ap.add_argument(
+        "--ranking-intervention-type",
+        default="min_across",
+        help="Which intervention's scores StaticGreedy ranks by. "
+             "Default 'min_across' is the §10.7 conservative headline.",
+    )
     ap.add_argument("--skip-sam", action="store_true")
     ap.add_argument("--skip-attribution", action="store_true")
     ap.add_argument("--skip-redaction", action="store_true")
@@ -593,6 +694,8 @@ def main() -> None:
         sam_max_regions=args.sam_max_regions,
         region_cap_for_attribution=args.region_cap_for_attribution,
         budgets=[float(x) for x in args.budgets.split(",")],
+        intervention_types=[x.strip() for x in args.intervention_types.split(",")],
+        ranking_intervention_type=args.ranking_intervention_type,
         skip_sam=args.skip_sam,
         skip_attribution=args.skip_attribution,
         skip_redaction=args.skip_redaction,
