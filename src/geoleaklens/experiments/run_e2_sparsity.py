@@ -61,6 +61,7 @@ from geoleaklens.modal_app import GeoCLIPModal, app
 from geoleaklens.models.inpaint_modal import LaMaModal
 from geoleaklens.redaction.baselines import LargestRegions, RandomRegions
 from geoleaklens.redaction.methods import StaticGreedy
+from geoleaklens.redaction.optimize import DynamicGreedy
 from geoleaklens.scoring.causal_scores import (
     DEFAULT_INTERVENTION_SET,
     min_across_interventions,
@@ -446,6 +447,133 @@ def _run_redaction_sweep(
     return pd.DataFrame(rows)
 
 
+def _run_dynamic_greedy_sweep(
+    df: pd.DataFrame,
+    regions: pd.DataFrame,
+    scores: pd.DataFrame,
+    geoclip: GeoCLIPModal,
+    *,
+    method: DynamicGreedy,
+    edit_intervention_type: str,
+    budgets: list[float],
+    threshold_km: float,
+    pred_jsonl: Path,
+    lama_modal=None,
+) -> pd.DataFrame:
+    """Per-image §12.2 dynamic greedy sweep with snapshots at each budget.
+
+    Returns rows in the same shape as `_run_redaction_sweep` (image_id /
+    method / target_area_frac / actual_area_frac / n_selected /
+    edited_error_km / edited_success_25km) so the aggregator can concat.
+
+    DynamicGreedy is fundamentally different from the score-based methods —
+    each pick requires a Modal-side GeoCLIP call on the trial-edited image.
+    The runner provides the model + intervention as callbacks; the
+    DynamicGreedy class itself stays Modal-agnostic (and unit-testable).
+    """
+    pred_jsonl.parent.mkdir(parents=True, exist_ok=True)
+    rows: list[dict] = []
+    pred_fp = open(pred_jsonl, "w")
+
+    if edit_intervention_type == "inpaint" and lama_modal is None:
+        raise ValueError("inpaint edit requested but lama_modal is None")
+
+    try:
+        for i, manifest_row in df.iterrows():
+            image_id = manifest_row["image_id"]
+            image_path = Path(manifest_row["image_path"])
+            if not image_path.exists():
+                print(f"[skip-dyn] missing image: {image_path}")
+                continue
+            true_lat = float(manifest_row["lat"])
+            true_lon = float(manifest_row["lon"])
+
+            with open(image_path, "rb") as f:
+                img_bytes = f.read()
+            orig_pred = geoclip.predict.remote(img_bytes)
+            orig_parsed = parse_geolocation_response(orig_pred)
+            orig_lat = orig_parsed["parsed"].get("lat")
+            orig_lon = orig_parsed["parsed"].get("lon")
+            original_error_km = haversine_km(orig_lat, orig_lon, true_lat, true_lon)
+            pil_image = Image.open(io.BytesIO(img_bytes)).convert("RGB")
+
+            # Closures over geoclip / lama_modal so DynamicGreedy stays
+            # decoupled from Modal types.
+            def _apply(image, mask):
+                return _apply_intervention(
+                    edit_intervention_type, image, mask, lama_modal=lama_modal
+                )
+
+            def _score(image):
+                buf = io.BytesIO()
+                image.save(buf, format="JPEG", quality=92)
+                pred = geoclip.predict.remote(buf.getvalue())
+                parsed = parse_geolocation_response(pred)
+                return parsed["parsed"].get("lat"), parsed["parsed"].get("lon")
+
+            def _load(path):
+                return _load_mask_npz(Path(path))
+
+            try:
+                result = method.run_image(
+                    image_id=image_id,
+                    regions=regions,
+                    scores=scores,
+                    budgets=budgets,
+                    original_image=pil_image,
+                    true_lat=true_lat,
+                    true_lon=true_lon,
+                    original_error_km=original_error_km,
+                    load_mask=_load,
+                    apply_intervention=_apply,
+                    score_image=_score,
+                )
+            except Exception as e:
+                print(
+                    f"[dyn-skip] {image_id}: {type(e).__name__}: {e}"
+                )
+                continue
+
+            for budget in budgets:
+                snap = result.snapshots[float(budget)]
+                rows.append({
+                    "image_id": image_id,
+                    "method": method.name,
+                    "target_area_frac": float(budget),
+                    "actual_area_frac": float(snap.actual_area_frac),
+                    "n_selected": len(snap.selected_region_ids),
+                    "edited_error_km": float(snap.edited_error_km),
+                    "edited_success_25km": bool(
+                        success_at(snap.edited_error_km, threshold_km)
+                    ),
+                })
+                pred_fp.write(json.dumps({
+                    "image_id": image_id,
+                    "image_variant_id": (
+                        f"{method.name}__b{int(budget*100)}__{edit_intervention_type}"
+                    ),
+                    "method": method.name,
+                    "target_area_frac": float(budget),
+                    "model_name": "geoclip",
+                    "parsed": {
+                        "lat": snap.edited_lat,
+                        "lon": snap.edited_lon,
+                    },
+                    "n_picks": result.n_picks,
+                    "stopped_early": result.stopped_early,
+                    "selected_region_ids": list(snap.selected_region_ids),
+                    "created_at": _now_iso(),
+                }) + "\n")
+                pred_fp.flush()
+            print(
+                f"[redact-dyn] {image_id}: {result.n_picks} picks, "
+                f"stopped_early={result.stopped_early} ({i+1}/{len(df)})"
+            )
+    finally:
+        pred_fp.close()
+    return pd.DataFrame(rows)
+
+
 def _aggregate_sparsity_curve(redactions: pd.DataFrame) -> pd.DataFrame:
     """Per (method, budget): mean Acc@25km across the conditional set."""
     return (
@@ -511,6 +639,9 @@ def run(
     budgets: list[float],
     intervention_types: list[str],  # NEW — which interventions to score under
     ranking_intervention_type: str,  # NEW — which scores StaticGreedy ranks by
+    include_dynamic_greedy: bool,
+    dynamic_greedy_top_k: int,
+    dynamic_greedy_edit_intervention: str,
     skip_sam: bool,
     skip_attribution: bool,
     skip_redaction: bool,
@@ -582,6 +713,13 @@ def run(
         redactions = pd.read_parquet(redactions_path)
         print(f"[redact] reusing {len(redactions)} rows from {redactions_path}")
     else:
+        # `dynamic_greedy_edit_intervention == "inpaint"` requires a live
+        # LaMa cls. Spin it up alongside GeoCLIP only when we need it so the
+        # common path (mean_mask edits) doesn't pay the cold-start tax.
+        needs_lama_for_dyn = (
+            include_dynamic_greedy
+            and dynamic_greedy_edit_intervention == "inpaint"
+        )
         with app.run():
             geoclip = GeoCLIPModal()
             redactions = _run_redaction_sweep(
@@ -591,6 +729,29 @@ def run(
                 threshold_km=threshold_km,
                 pred_jsonl=pred_redaction_jsonl,
             )
+            if include_dynamic_greedy:
+                lama_for_dyn = LaMaModal() if needs_lama_for_dyn else None
+                dyn_method = DynamicGreedy(
+                    intervention_type=ranking_intervention_type,
+                    top_k=dynamic_greedy_top_k,
+                )
+                # Append dynamic-greedy rows to the predictions JSONL so the
+                # downstream tooling sees one stream per E2 run.
+                dyn_pred_jsonl = pred_redaction_jsonl.with_name(
+                    pred_redaction_jsonl.stem + "__dynamic.jsonl"
+                )
+                dyn_rows = _run_dynamic_greedy_sweep(
+                    df, regions, scores, geoclip,
+                    method=dyn_method,
+                    edit_intervention_type=dynamic_greedy_edit_intervention,
+                    budgets=budgets,
+                    threshold_km=threshold_km,
+                    pred_jsonl=dyn_pred_jsonl,
+                    lama_modal=lama_for_dyn,
+                )
+                redactions = pd.concat([redactions, dyn_rows], ignore_index=True)
+                print(f"[redact-dyn] appended {len(dyn_rows)} rows; "
+                      f"predictions at {dyn_pred_jsonl}")
         redactions_path.parent.mkdir(parents=True, exist_ok=True)
         redactions.to_parquet(redactions_path, index=False)
         print(f"[redact] wrote {redactions_path} ({len(redactions)} rows)")
@@ -672,6 +833,26 @@ def main() -> None:
         help="Which intervention's scores StaticGreedy ranks by. "
              "Default 'min_across' is the §10.7 conservative headline.",
     )
+    ap.add_argument(
+        "--include-dynamic-greedy",
+        action="store_true",
+        help="Add §12.2 dynamic greedy alongside the score-based methods. "
+             "Expensive: top_k * n_picks GeoCLIP calls per image. "
+             "Off by default — opt in when you want the spec's headline measure.",
+    )
+    ap.add_argument(
+        "--dynamic-greedy-top-k",
+        type=int,
+        default=30,
+        help="Initial candidate shortlist size for dynamic greedy (§12.2 default).",
+    )
+    ap.add_argument(
+        "--dynamic-greedy-edit-intervention",
+        default="mean_mask",
+        choices=["mean_mask", "blur", "inpaint"],
+        help="Intervention applied during dynamic-greedy selection. "
+             "Default 'mean_mask' matches the existing redaction sweep.",
+    )
     ap.add_argument("--skip-sam", action="store_true")
     ap.add_argument("--skip-attribution", action="store_true")
     ap.add_argument("--skip-redaction", action="store_true")
@@ -696,6 +877,9 @@ def main() -> None:
         budgets=[float(x) for x in args.budgets.split(",")],
         intervention_types=[x.strip() for x in args.intervention_types.split(",")],
         ranking_intervention_type=args.ranking_intervention_type,
+        include_dynamic_greedy=args.include_dynamic_greedy,
+        dynamic_greedy_top_k=args.dynamic_greedy_top_k,
+        dynamic_greedy_edit_intervention=args.dynamic_greedy_edit_intervention,
         skip_sam=args.skip_sam,
         skip_attribution=args.skip_attribution,
         skip_redaction=args.skip_redaction,
