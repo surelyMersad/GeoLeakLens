@@ -66,7 +66,14 @@ geoclip_image = (
         extra_index_url="https://download.pytorch.org/whl/cu121",
     )
     .pip_install(
-        "geoclip",
+        # geoclip 1.2.0 calls `CLIPModel.get_image_features(...)` and treats the
+        # result as a tensor. transformers `main` (and likely 4.50+) changed
+        # that method to return a `BaseModelOutputWithPooling` dataclass, which
+        # then crashes geoclip's MLP head with a `linear(): argument 'input'
+        # must be Tensor` TypeError. 4.45.2 is the last release where the old
+        # tensor-return contract holds. Pin until upstream geoclip catches up.
+        "transformers==4.45.2",
+        "geoclip==1.2.0",
         "numpy>=1.24",
         "pillow>=10",
     )
@@ -113,13 +120,24 @@ class GeoCLIPModal:
 
     @modal.method()
     def predict(self, image_bytes: bytes, top_k: int = 5) -> dict:
-        import io
-        import torch
-        from PIL import Image
+        import os
+        import tempfile
 
-        img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
-        with torch.inference_mode():
-            top_pred_gps, top_pred_prob = self.model.predict(img, top_k=top_k)
+        import torch
+
+        # GeoCLIP.model.predict() takes a path string and re-opens the file
+        # itself (it does Image.open(image_path) internally). Passing a PIL
+        # Image trips an AttributeError inside PIL. Write to a tempfile so we
+        # can stay on the bytes-in / bytes-out interface across the Modal
+        # boundary while feeding GeoCLIP the path it expects.
+        with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as f:
+            f.write(image_bytes)
+            tmp_path = f.name
+        try:
+            with torch.inference_mode():
+                top_pred_gps, top_pred_prob = self.model.predict(tmp_path, top_k=top_k)
+        finally:
+            os.unlink(tmp_path)
         # `top_pred_gps` shape (top_k, 2): [[lat, lon], ...]; `top_pred_prob` shape (top_k,).
         top_pred_gps = top_pred_gps.cpu().tolist()
         top_pred_prob = top_pred_prob.cpu().tolist()
