@@ -98,6 +98,25 @@ qwen_image = (
     )
 )
 
+# EasyOCR for §9.3 text-region detection. Light enough to run on T4 with
+# room to spare. Weights (~100-200 MB across detection + recognition
+# models) cache in a Modal volume so cold-starts skip the download.
+easyocr_image = (
+    modal.Image.debian_slim(python_version=_PYTHON)
+    .apt_install("libgl1", "libglib2.0-0")  # opencv runtime deps for EasyOCR
+    .pip_install(
+        "torch==2.4.1",
+        "torchvision==0.19.1",
+        extra_index_url="https://download.pytorch.org/whl/cu121",
+    )
+    .pip_install(
+        "easyocr>=1.7",
+        "opencv-python-headless>=4.9",
+        "pillow>=10",
+        "numpy>=1.24,<2",  # easyocr trips on numpy 2 in some paths
+    )
+)
+
 # LaMa inpainting (§10.4). simple-lama-inpainting wraps Suvorov et al.'s
 # Big LaMa model and handles weight download. Weights persist in a Modal
 # volume so cold-starts after the first don't re-download ~200 MB.
@@ -133,10 +152,15 @@ cache_volume = modal.Volume.from_name(
 lama_cache = modal.Volume.from_name(
     "geoleaklens-lama-cache", create_if_missing=True
 )
+# Persistent volume for EasyOCR detection + recognition weights (~150 MB).
+easyocr_cache = modal.Volume.from_name(
+    "geoleaklens-easyocr-cache", create_if_missing=True
+)
 
 CACHE_MOUNT = "/cache"
 SAM_CKPT_MOUNT = "/checkpoints"
 LAMA_CACHE_MOUNT = "/lama_cache"
+EASYOCR_CACHE_MOUNT = "/easyocr_cache"
 
 app = modal.App("geoleaklens")
 
