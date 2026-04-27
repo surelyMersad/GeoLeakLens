@@ -241,7 +241,42 @@ def run(
     labeled_df.to_parquet(labeled_regions_path, index=False)
     print(f"[e3] wrote {labeled_regions_path} ({len(labeled_df)} rows)")
 
-    # --- 4. Aggregate -------------------------------------------------
+    # --- 3b. Text-light subset (§13.E3 companion) ----------------------
+    # An image is "text-light" when total OCR pixel coverage < 2% of the
+    # image area. We compute this from the union of all OCR masks per
+    # image (so overlapping detections don't double-count).
+    text_frac_per_image: dict[str, float] = {}
+    for image_id in image_ids:
+        sub_regions = regions[regions["image_id"] == image_id]
+        if sub_regions.empty:
+            text_frac_per_image[image_id] = 0.0
+            continue
+        # Use the regions parquet's first mask for shape (cheap; we only
+        # need (H, W)).
+        try:
+            ref = _load_mask_npz(Path(sub_regions.iloc[0]["mask_path"]))
+        except Exception:
+            text_frac_per_image[image_id] = 0.0
+            continue
+        h, w = ref.shape
+        total_area = float(h * w) if h * w > 0 else 1.0
+        ocr_dets = ocr_per_image.get(image_id, [])
+        ocr_rows = detections_to_regions(ocr_dets, image_id, (h, w))
+        if not ocr_rows:
+            text_frac_per_image[image_id] = 0.0
+            continue
+        union = np.zeros((h, w), dtype=bool)
+        for r in ocr_rows:
+            union |= r["mask"]
+        text_frac_per_image[image_id] = float(union.sum()) / total_area
+    text_light_ids = {iid for iid, f in text_frac_per_image.items() if f < 0.02}
+    print(
+        f"[text-light] {len(text_light_ids)}/{len(image_ids)} images have "
+        f"OCR coverage < 2% (median text frac = "
+        f"{np.median(list(text_frac_per_image.values())):.4f})"
+    )
+
+    # --- 4. Aggregate (full + text-light) -----------------------------
     summary = aggregate_by_bucket(
         labeled_df, scores,
         intervention_type=intervention_type,
@@ -249,6 +284,19 @@ def run(
     )
     table_path.parent.mkdir(parents=True, exist_ok=True)
     summary.to_csv(table_path, index=False, float_format="%.4f")
+
+    summary_textlight = aggregate_by_bucket(
+        labeled_df[labeled_df["image_id"].isin(text_light_ids)],
+        scores,
+        intervention_type=intervention_type,
+        top_k=top_k,
+    )
+    textlight_path = table_path.with_name(
+        table_path.stem + "_textlight" + table_path.suffix
+    )
+    summary_textlight.to_csv(textlight_path, index=False, float_format="%.4f")
+    print(f"[e3] wrote text-light subset table to {textlight_path} "
+          f"({len(text_light_ids)} images)")
 
     print("\n=== §13.E3 cue taxonomy summary ===")
     cols = ["bucket", "n_regions",
