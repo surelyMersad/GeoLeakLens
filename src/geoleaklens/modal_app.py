@@ -154,15 +154,20 @@ class GeoCLIPModal:
 # ---- Health check -----------------------------------------------------------
 @app.function(image=geoclip_image, gpu="L4", timeout=120)
 def ping() -> dict:
-    """Sanity check: container starts, GPU is visible, geoclip imports."""
+    """Sanity check: container starts, GPU is visible, geoclip imports.
+
+    Cast everything to plain Python types — `torch.__version__` is actually a
+    `TorchVersion` (str subclass) whose unpickling requires torch on the
+    *local* side. We deliberately don't install torch locally, so cast to str.
+    """
     import torch
 
-    info = {
-        "torch_version": torch.__version__,
-        "cuda_available": torch.cuda.is_available(),
-        "device_name": torch.cuda.get_device_name(0) if torch.cuda.is_available() else None,
+    cuda_available = bool(torch.cuda.is_available())
+    return {
+        "torch_version": str(torch.__version__),
+        "cuda_available": cuda_available,
+        "device_name": str(torch.cuda.get_device_name(0)) if cuda_available else None,
     }
-    return info
 
 
 @app.local_entrypoint()
