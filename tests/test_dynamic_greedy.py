@@ -64,38 +64,71 @@ def _mock_load_mask(h=4, w=4):
 
 
 def _mock_apply_intervention():
-    """Identity: return the original image. The score_image fixture
+    """Identity: return the original image. The score_images fixture
     inspects the mask separately via state, so we don't actually edit
     pixels here. Real interventions are unit-tested in test_blur.py /
-    test_inpaint.py / test_mean_mask.py."""
+    test_inpaint.py / test_mean_mask.py.
+
+    DynamicGreedy now calls `apply_intervention` once per candidate to
+    build the trial-images list, then makes a single batched
+    `score_images([...])` call. We queue each call's mask onto a list
+    that the mock score function consumes in lockstep.
+    """
     def apply(image: Image.Image, mask: np.ndarray) -> Image.Image:
-        # Stash the mask on the image so the mock score_image can read it.
-        # Pillow images are mutable enough; we use a side-channel dict.
-        image_id_state["last_mask"] = mask.copy()
+        image_id_state.setdefault("queued_masks", []).append(mask.copy())
         return image
     return apply
 
 
-image_id_state: dict = {}
+# Per-test state for queued masks. Tests reset by re-creating the mock.
+image_id_state: dict = {"queued_masks": []}
+
+
+def _reset_state():
+    image_id_state["queued_masks"] = []
 
 
 def _scoring_factory(error_for_mask):
-    """Build a score_image that returns (lat, lon) where the implied error
-    matches `error_for_mask(mask) -> error_km`. We synthesize lat/lon from
-    error so haversine_km recovers the right value."""
-    true_lat, true_lon = 0.0, 0.0  # simple — origin is "true location"
+    """Build a `score_images` that returns a list of (lat, lon) per input,
+    matching `error_for_mask(mask) -> error_km` for each. We synthesize
+    lat/lon from error so haversine_km recovers the right value.
 
-    def score(image: Image.Image):
-        m = image_id_state.get("last_mask", np.zeros((4, 4), dtype=bool))
-        err = error_for_mask(m)
-        # Approximate: 1 degree of lat at the equator ≈ 111 km.
-        lat_off = err / 111.0
-        return (lat_off, 0.0)
+    The fixture is batched to match the runner contract — DynamicGreedy
+    fans out K candidate scorings per iteration via `score_images([...])`.
+    The mock applies each candidate's mask in turn (the apply_intervention
+    fixture stashes per-call masks via `image_id_state["queued_masks"]`).
+    """
+    true_lat, true_lon = 0.0, 0.0  # origin is "true location"
+
+    def score(images: list):
+        masks = image_id_state.get("queued_masks", [])
+        if len(masks) != len(images):
+            # Defensive: tests should keep these in lockstep, but if a
+            # divergence ever sneaks in, surface it clearly.
+            raise AssertionError(
+                f"queued_masks length {len(masks)} != batch size {len(images)}"
+            )
+        out = []
+        for m in masks:
+            err = error_for_mask(m)
+            lat_off = err / 111.0  # ~1° lat ≈ 111 km
+            out.append((lat_off, 0.0))
+        # Reset for next batch.
+        image_id_state["queued_masks"] = []
+        return out
 
     return score, (true_lat, true_lon)
 
 
 # ----- Tests ----------------------------------------------------------------
+
+@pytest.fixture(autouse=True)
+def _reset_queued_state_between_tests():
+    """A failed test could leave masks in the global queue; clear before each."""
+    image_id_state["queued_masks"] = []
+    yield
+    image_id_state["queued_masks"] = []
+
 
 def test_dynamic_greedy_picks_in_joint_effect_order():
     """Region 'b' has low single-region score but high JOINT score with 'a'.
@@ -126,7 +159,7 @@ def test_dynamic_greedy_picks_in_joint_effect_order():
         original_error_km=1.0,
         load_mask=_mock_load_mask(),
         apply_intervention=_mock_apply_intervention(),
-        score_image=score_image,
+        score_images=score_image,
     )
     # First pick = 'a' (biggest standalone effect): ~50 km gain.
     # Second pick = 'b' (joint with a → 100 km > a+c=70): wins despite low score.
@@ -158,7 +191,7 @@ def test_top_k_caps_initial_candidate_pool():
         original_error_km=1.0,
         load_mask=_mock_load_mask(),
         apply_intervention=_mock_apply_intervention(),
-        score_image=score_image,
+        score_images=score_image,
     )
     # top_k=2 admits only {d, a} (highest scores). Despite c being in the
     # full set, dynamic greedy can never see it.
@@ -189,7 +222,7 @@ def test_records_state_at_each_budget_threshold():
         original_error_km=1.0,
         load_mask=_mock_load_mask(),
         apply_intervention=_mock_apply_intervention(),
-        score_image=score_image,
+        score_images=score_image,
     )
     # Each region is 0.05 area; one pick per budget threshold.
     assert len(result.snapshots[0.05].selected_region_ids) == 1
@@ -220,7 +253,7 @@ def test_stops_when_no_candidate_increases_error():
         original_error_km=1.0,
         load_mask=_mock_load_mask(),
         apply_intervention=_mock_apply_intervention(),
-        score_image=score_image,
+        score_images=score_image,
     )
     # Pick 'a' (49 → 50 = +49). Then b would make it WORSE for redaction
     # purposes (50 → 49 = -1), so stop rather than add.
@@ -252,7 +285,7 @@ def test_early_stop_triggers_when_marginal_drops():
         original_error_km=1.0,
         load_mask=_mock_load_mask(),
         apply_intervention=_mock_apply_intervention(),
-        score_image=score_image,
+        score_images=score_image,
     )
     assert result.stopped_early is True
     assert result.n_picks <= 3   # stopped before consuming all 4
@@ -291,7 +324,7 @@ def test_skips_oversized_candidates_to_stay_within_budget():
         original_error_km=1.0,
         load_mask=_mock_load_mask(),
         apply_intervention=_mock_apply_intervention(),
-        score_image=score_image,
+        score_images=score_image,
     )
     assert "huge" not in result.snapshots[0.10].selected_region_ids
     assert "small" in result.snapshots[0.10].selected_region_ids
@@ -310,7 +343,7 @@ def test_empty_scores_returns_empty_snapshots():
         original_error_km=42.0,
         load_mask=_mock_load_mask(),
         apply_intervention=_mock_apply_intervention(),
-        score_image=lambda _img: (None, None),
+        score_images=lambda imgs: [(None, None)] * len(imgs),
     )
     assert result.n_picks == 0
     assert result.snapshots[0.10].selected_region_ids == []
@@ -334,7 +367,7 @@ def test_all_budgets_covered_in_snapshots():
         original_error_km=1.0,
         load_mask=_mock_load_mask(),
         apply_intervention=_mock_apply_intervention(),
-        score_image=score_image,
+        score_images=score_image,
     )
     # Only one region (5% area). All three budgets see it.
     for b in (0.05, 0.10, 0.20):

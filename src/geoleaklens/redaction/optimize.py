@@ -39,11 +39,18 @@ is *itself* the recomputation — Δ_r naturally accounts for what's already
 in the selected set. No separate per-candidate single-region rescoring
 pass.
 
-Cost
-----
+Cost / concurrency
+------------------
 Per (image, full budget sweep): top_k × n_picks GeoCLIP calls.
-Default K=30, ~10 picks → 300 calls/image. For 30-image E2: 9000 calls
-(~4h sequential on L4). Concurrent `.map()` would help; deferred.
+Default K=30, ~10 picks → 300 calls/image.
+
+The `score_images` callback is **batched** — it takes a list of trial
+images and returns a list of (lat, lon) tuples. The runner implements
+this via `geoclip.predict.map(bytes_list)` so all K candidate
+evaluations at one iteration step fan out to Modal in parallel. With
+Modal's default container scaling (~100 concurrent), one step's
+latency drops from K * roundtrip to ~1 roundtrip + cold-spin.
+Sequential ~4h E2 run → ~30 min concurrent.
 """
 from __future__ import annotations
 
@@ -118,11 +125,18 @@ class DynamicGreedy:
         original_error_km: float,
         load_mask: Callable[[str], np.ndarray],
         apply_intervention: Callable[[Image.Image, np.ndarray], Image.Image],
-        score_image: Callable[
-            [Image.Image], tuple[Optional[float], Optional[float]]
+        score_images: Callable[
+            [list[Image.Image]],
+            list[tuple[Optional[float], Optional[float]]],
         ],
     ) -> DynamicGreedyResult:
-        """Run dynamic greedy on one image, capturing per-budget snapshots."""
+        """Run dynamic greedy on one image, capturing per-budget snapshots.
+
+        `score_images` is **batched**: takes a list of trial images and returns
+        a same-length list of (lat, lon) tuples. The runner implementation
+        uses Modal `.map()` so the K candidate scorings at one step fan out
+        in parallel.
+        """
         budgets = sorted({float(b) for b in budgets if b > 0})
         if not budgets:
             return DynamicGreedyResult(
@@ -203,19 +217,41 @@ class DynamicGreedy:
             if not remaining:
                 break
 
+            # Filter to the candidates that still fit in the loosest budget.
+            # We do this BEFORE the model call so we don't waste fan-out
+            # on regions that can never be picked at any budget level.
+            fitting = [
+                r for r in remaining
+                if used_area + candidate_areas[r]
+                   <= max_budget + _AREA_TOLERANCE_PP
+            ]
+            if not fitting:
+                break
+
+            # Build all trial images locally (CPU-bound mask union +
+            # intervention application). This is fast for mean_mask / blur;
+            # inpaint-as-edit is a Modal call per region — that path isn't
+            # batched yet.
+            trial_images: list[Image.Image] = [
+                apply_intervention(original_image, _union_for(extra=r))
+                for r in fitting
+            ]
+
+            # Single fan-out: the runner's `score_images` is `predict.map(...)`
+            # so all K trial images get scored in parallel by Modal.
+            batch_results = score_images(trial_images)
+            if len(batch_results) != len(fitting):
+                raise RuntimeError(
+                    f"score_images returned {len(batch_results)} results for "
+                    f"{len(fitting)} inputs — batch size mismatch"
+                )
+
             best_r: Optional[str] = None
             best_delta = -math.inf
             best_lat: Optional[float] = None
             best_lon: Optional[float] = None
             best_err: Optional[float] = None
-
-            for r in remaining:
-                if used_area + candidate_areas[r] > max_budget + _AREA_TOLERANCE_PP:
-                    # Won't fit even at the loosest budget — skip.
-                    continue
-                trial_mask = _union_for(extra=r)
-                trial_image = apply_intervention(original_image, trial_mask)
-                edit_lat, edit_lon = score_image(trial_image)
+            for r, (edit_lat, edit_lon) in zip(fitting, batch_results):
                 trial_err = haversine_km(edit_lat, edit_lon, true_lat, true_lon)
                 trial_err_clipped = clip_error_km(trial_err)
                 delta = trial_err_clipped - current_error_km

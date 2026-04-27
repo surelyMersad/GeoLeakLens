@@ -504,12 +504,37 @@ def _run_dynamic_greedy_sweep(
                     edit_intervention_type, image, mask, lama_modal=lama_modal
                 )
 
-            def _score(image):
-                buf = io.BytesIO()
-                image.save(buf, format="JPEG", quality=92)
-                pred = geoclip.predict.remote(buf.getvalue())
-                parsed = parse_geolocation_response(pred)
-                return parsed["parsed"].get("lat"), parsed["parsed"].get("lon")
+            def _score_batch(images: list[Image.Image]):
+                """Fan out K candidate scorings via Modal `.map()` so they run
+                concurrently across GeoCLIPModal containers. Falls back to a
+                single sequential call when batch size is 1 — `.map()` works
+                fine there too but `.remote()` is one less round-trip.
+                """
+                if not images:
+                    return []
+                bytes_list: list[bytes] = []
+                for img in images:
+                    buf = io.BytesIO()
+                    img.save(buf, format="JPEG", quality=92)
+                    bytes_list.append(buf.getvalue())
+                if len(bytes_list) == 1:
+                    raw = geoclip.predict.remote(bytes_list[0])
+                    parsed = parse_geolocation_response(raw)
+                    return [(
+                        parsed["parsed"].get("lat"),
+                        parsed["parsed"].get("lon"),
+                    )]
+                # `.map(iterable)` returns a generator yielding results in
+                # input order. Each is the @modal.method's return value.
+                results = list(geoclip.predict.map(bytes_list))
+                out: list[tuple] = []
+                for raw in results:
+                    parsed = parse_geolocation_response(raw)
+                    out.append(
+                        (parsed["parsed"].get("lat"),
+                         parsed["parsed"].get("lon"))
+                    )
+                return out
 
             def _load(path):
                 return _load_mask_npz(Path(path))
@@ -526,7 +551,7 @@ def _run_dynamic_greedy_sweep(
                     original_error_km=original_error_km,
                     load_mask=_load,
                     apply_intervention=_apply,
-                    score_image=_score,
+                    score_images=_score_batch,
                 )
             except Exception as e:
                 print(
