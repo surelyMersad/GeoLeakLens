@@ -98,6 +98,29 @@ qwen_image = (
     )
 )
 
+# LaMa inpainting (§10.4). simple-lama-inpainting wraps Suvorov et al.'s
+# Big LaMa model and handles weight download. Weights persist in a Modal
+# volume so cold-starts after the first don't re-download ~200 MB.
+#
+# `simple-lama-inpainting==0.1.2` (only release) has stale upper pins on
+# pillow (<10) and numpy (<2). Don't co-install pillow / opencv-headless
+# in the same layer or pip's resolver gives up — let simple-lama pull its
+# own pillow 9.x and opencv-python. This image is isolated from the
+# geoclip/qwen/sam images so older pillow here doesn't affect them.
+lama_image = (
+    modal.Image.debian_slim(python_version=_PYTHON)
+    .apt_install("libgl1", "libglib2.0-0")  # opencv runtime deps used by LaMa
+    .pip_install(
+        "torch==2.4.1",
+        "torchvision==0.19.1",
+        extra_index_url="https://download.pytorch.org/whl/cu121",
+    )
+    .pip_install(
+        "simple-lama-inpainting==0.1.2",
+        "numpy>=1.24,<2",  # match simple-lama's <2 ceiling
+    )
+)
+
 # ---- Volumes ----------------------------------------------------------------
 
 sam_checkpoints = modal.Volume.from_name(
@@ -106,9 +129,14 @@ sam_checkpoints = modal.Volume.from_name(
 cache_volume = modal.Volume.from_name(
     "geoleaklens-cache", create_if_missing=True
 )
+# Persistent volume for LaMa weights (~200 MB).
+lama_cache = modal.Volume.from_name(
+    "geoleaklens-lama-cache", create_if_missing=True
+)
 
 CACHE_MOUNT = "/cache"
 SAM_CKPT_MOUNT = "/checkpoints"
+LAMA_CACHE_MOUNT = "/lama_cache"
 
 app = modal.App("geoleaklens")
 
