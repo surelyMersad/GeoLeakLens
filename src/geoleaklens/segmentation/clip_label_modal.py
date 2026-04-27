@@ -120,6 +120,49 @@ class CLIPLabelModal:
         return text_features
 
     @modal.method()
+    def cosine_similarity_pairs(
+        self,
+        pairs: list[tuple[bytes, bytes]],
+    ) -> list[float]:
+        """Cosine similarity between matched (a, b) image pairs.
+
+        Used by §13.E4 for the per-(method, budget, image) utility metric:
+        sim(original, redacted). Encodes all 2*N images in one batch and
+        returns N cos-sim values.
+
+        We avoid de-dup of repeated `a` bytes (each pair carries its own
+        copy) — the runner could pre-de-dup by image_id if many pairs
+        share the same original, but the encoding cost is small enough
+        that we don't bother here.
+        """
+        import torch
+        import torch.nn.functional as F
+        from PIL import Image
+
+        if not pairs:
+            return []
+
+        # Flatten pairs into a single list, encode in one batch.
+        flat: list[Image.Image] = []
+        for a, b in pairs:
+            flat.append(Image.open(io.BytesIO(a)).convert("RGB"))
+            flat.append(Image.open(io.BytesIO(b)).convert("RGB"))
+
+        inputs = self.processor(images=flat, return_tensors="pt").to(self.device)
+        if self.device == "cuda":
+            inputs = {k: v.to(self.dtype) if v.is_floating_point() else v
+                      for k, v in inputs.items()}
+        with torch.inference_mode():
+            features = self.model.get_image_features(**inputs)
+            features = F.normalize(features.float(), dim=-1)
+
+        # Each pair occupies two consecutive rows in `features`.
+        a_feats = features[0::2]
+        b_feats = features[1::2]
+        sims = (a_feats * b_feats).sum(dim=-1).cpu().tolist()
+        return [float(s) for s in sims]
+
+    @modal.method()
     def label_bboxes(
         self,
         image_bytes: bytes,
