@@ -25,3 +25,6 @@ outputs/logs/
 .env
 .env.local
 .env.*.local
+
+# Local inspection folders (ad-hoc image triage, not pipeline output)
+inspect_*/
