@@ -84,3 +84,40 @@ def test_paired_difference_zero_when_methods_identical():
     assert res.point_estimate == pytest.approx(0.0)
     assert res.ci_low == pytest.approx(0.0)
     assert res.ci_high == pytest.approx(0.0)
+
+
+# ----- §11.6 mean-statistic variant for 0/1 indicator data ------------------
+
+def test_bootstrap_mean_recovers_proportion():
+    """A 0/1 indicator (Acc@25km) needs mean, not median (median collapses
+    to 0 or 1)."""
+    from geoleaklens.scoring.bootstrap import bootstrap_mean
+    values = [0, 0, 0, 1, 1, 1, 1, 0, 1, 1]   # 60% rate
+    res = bootstrap_mean(values, n_bootstrap=500, seed=0)
+    assert res.point_estimate == pytest.approx(0.6)
+    # CI is wide at n=10 but should bracket the true rate.
+    assert res.ci_low <= 0.6 <= res.ci_high
+
+
+def test_bootstrap_paired_difference_with_mean_statistic():
+    """Pair where method A beats method B by ~10pp on average."""
+    rng = np.random.default_rng(11)
+    n = 200
+    base = rng.binomial(1, 0.5, size=n)
+    # method_a flips 10% of zeros to ones (so it's strictly better-or-equal)
+    a = base.copy()
+    flip = rng.random(size=n) < 0.20
+    a[(base == 0) & flip] = 1
+    b = base
+    res = bootstrap_paired_difference(
+        a, b, statistic="mean", n_bootstrap=500, seed=42
+    )
+    # Per-image diff is 0 or 1; mean ≈ 0.10. CI should exclude zero.
+    assert res.point_estimate > 0.05
+    assert res.ci_low > 0.0
+
+
+def test_bootstrap_statistic_rejects_unknown_statistic():
+    from geoleaklens.scoring.bootstrap import bootstrap_statistic
+    with pytest.raises(ValueError, match="unknown statistic"):
+        bootstrap_statistic([1.0, 2.0, 3.0], statistic="trimmed_mean")  # type: ignore[arg-type]

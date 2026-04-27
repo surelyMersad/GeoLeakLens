@@ -18,7 +18,7 @@ This module is pure NumPy. Callers feed in plain Python lists or arrays.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional, Sequence
+from typing import Literal, Optional, Sequence
 
 import numpy as np
 
@@ -26,6 +26,25 @@ import numpy as np
 DEFAULT_N_BOOTSTRAP = 1000
 DEFAULT_SEED = 123
 DEFAULT_STRATIFY_MIN_PER_STRATUM = 30
+
+Statistic = Literal["median", "mean"]
+
+
+def _apply_statistic(samples: np.ndarray, statistic: Statistic) -> np.ndarray:
+    """Apply the requested statistic across rows. samples shape (B, n)."""
+    if statistic == "median":
+        return np.median(samples, axis=1)
+    if statistic == "mean":
+        return np.mean(samples, axis=1)
+    raise ValueError(f"unknown statistic: {statistic!r}")
+
+
+def _point_estimate(values: np.ndarray, statistic: Statistic) -> float:
+    if statistic == "median":
+        return float(np.median(values))
+    if statistic == "mean":
+        return float(np.mean(values))
+    raise ValueError(f"unknown statistic: {statistic!r}")
 
 
 @dataclass
@@ -70,17 +89,24 @@ def _sample_indices_stratified(
     return out
 
 
-def bootstrap_median(
+def bootstrap_statistic(
     values: Sequence[float],
     *,
+    statistic: Statistic = "median",
     strata: Optional[Sequence] = None,
     n_bootstrap: int = DEFAULT_N_BOOTSTRAP,
     seed: int = DEFAULT_SEED,
     stratify_min_per_stratum: int = DEFAULT_STRATIFY_MIN_PER_STRATUM,
     ci: float = 0.95,
 ) -> BootstrapResult:
-    """Bootstrap CI for the median of `values`. Stratifies when `strata` is
-    given and every stratum has at least `stratify_min_per_stratum` samples.
+    """Bootstrap CI for an arbitrary statistic (median or mean) of `values`.
+
+    `statistic="mean"` is needed for Acc@25km bootstraps (0/1 indicator
+    where median collapses to 0 or 1). `statistic="median"` is the §11.2
+    default for geodesic error.
+
+    Stratifies when `strata` is given and every stratum has at least
+    `stratify_min_per_stratum` samples (§11.6 stratification rule).
 
     Returns the percentile-CI variant; bias-corrected accelerated (BCa)
     is listed in default.yaml as a follow-up — implement when needed.
@@ -106,9 +132,6 @@ def bootstrap_median(
         if len(s) != n:
             raise ValueError("strata length must match values length")
         unique, counts = np.unique(s, return_counts=True)
-        # Only stratify if EVERY stratum meets the minimum (per §11.6
-        # "If a stratum has ≥30 images, include it; if not, drop
-        # stratification entirely").
         if (counts >= stratify_min_per_stratum).all() and len(unique) > 1:
             use_strata = True
 
@@ -117,14 +140,14 @@ def bootstrap_median(
     else:
         idx = _sample_indices_unstratified(n, n_bootstrap, rng)
 
-    samples = arr[idx]                      # shape (B, n)
-    medians = np.median(samples, axis=1)    # shape (B,)
+    samples = arr[idx]                                  # shape (B, n)
+    stat = _apply_statistic(samples, statistic)         # shape (B,)
 
-    point = float(np.median(arr))
+    point = _point_estimate(arr, statistic)
     alpha = (1.0 - ci) / 2.0
-    lo = float(np.quantile(medians, alpha))
-    hi = float(np.quantile(medians, 1.0 - alpha))
-    se = float(np.std(medians, ddof=1))
+    lo = float(np.quantile(stat, alpha))
+    hi = float(np.quantile(stat, 1.0 - alpha))
+    se = float(np.std(stat, ddof=1)) if len(stat) > 1 else 0.0
 
     return BootstrapResult(
         point_estimate=point,
@@ -137,30 +160,47 @@ def bootstrap_median(
     )
 
 
+def bootstrap_median(values: Sequence[float], **kwargs) -> BootstrapResult:
+    """Backward-compatible alias for the median variant."""
+    return bootstrap_statistic(values, statistic="median", **kwargs)
+
+
+def bootstrap_mean(values: Sequence[float], **kwargs) -> BootstrapResult:
+    """Convenience alias for the mean variant — needed for 0/1 indicator
+    bootstraps (Acc@25km, parse rate, etc.) where median collapses."""
+    return bootstrap_statistic(values, statistic="mean", **kwargs)
+
+
 def bootstrap_paired_difference(
     values_a: Sequence[float],
     values_b: Sequence[float],
     *,
+    statistic: Statistic = "median",
     strata: Optional[Sequence] = None,
     n_bootstrap: int = DEFAULT_N_BOOTSTRAP,
     seed: int = DEFAULT_SEED,
     stratify_min_per_stratum: int = DEFAULT_STRATIFY_MIN_PER_STRATUM,
     ci: float = 0.95,
 ) -> BootstrapResult:
-    """Paired bootstrap of `median(a - b)` over the same image indices.
+    """Paired bootstrap of `statistic(a - b)` over matching indices.
 
-    Reports the per-image median of (a - b). For E2 / E4 method comparisons
-    where `values_a[i]` and `values_b[i]` are the same image scored under
-    two methods, this is the right comparison: it captures within-image
-    variation rather than treating the two samples as independent.
+    For E2 / E4 method comparisons where `values_a[i]` and `values_b[i]`
+    are the same image scored under two methods, this is the right
+    comparison: it captures within-image variation rather than treating
+    the two samples as independent.
+
+    `statistic="mean"` is the right choice for 0/1 indicator data
+    (Acc@25km drop) where median collapses. `statistic="median"` is the
+    §11.2 default for continuous error data.
     """
     a = np.asarray(values_a, dtype=np.float64)
     b = np.asarray(values_b, dtype=np.float64)
     if len(a) != len(b):
         raise ValueError("paired bootstrap requires equal-length inputs")
     diffs = a - b
-    return bootstrap_median(
+    return bootstrap_statistic(
         diffs,
+        statistic=statistic,
         strata=strata,
         n_bootstrap=n_bootstrap,
         seed=seed,
