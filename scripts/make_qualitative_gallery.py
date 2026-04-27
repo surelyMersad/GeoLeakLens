@@ -33,7 +33,16 @@ from geoleaklens.redaction.baselines import LargestRegions, RandomRegions
 ROOT = Path(__file__).resolve().parents[1]
 THRESHOLD_KM = 25.0
 BUDGET = 0.05  # the budget where the bootstrap CI excludes zero
-OUTPUT_PATH = ROOT / "outputs/figures/e2_qualitative_gallery.png"
+
+# Versioned source paths so we can re-run this script after a scale-up
+# without changing the code (just env vars or a small CLI later).
+import os
+_VARIANT = os.environ.get("GALLERY_VARIANT", "v3")  # default uses n=100 v3
+SUFFIX = f"_{_VARIANT}" if _VARIANT and _VARIANT != "v2" else ""
+REGIONS_PATH = ROOT / f"data/processed/regions/E2_im2gps3k{('_' + _VARIANT) if _VARIANT != 'v2' else ''}_sam.parquet"
+REDACTIONS_PATH = ROOT / f"data/processed/redactions/E2_im2gps3k_{_VARIANT}.parquet"
+DYNAMIC_JSONL_PATH = ROOT / f"data/processed/predictions/geoclip/E2_im2gps3k_redacted_{_VARIANT}__dynamic.jsonl"
+OUTPUT_PATH = ROOT / f"outputs/figures/e2_qualitative_gallery{SUFFIX}.png"
 
 
 def _load_mask_npz(path: Path) -> np.ndarray:
@@ -85,11 +94,12 @@ def _build_redacted_image(
 
 def main() -> None:
     manifest = pd.read_parquet(ROOT / "data/processed/manifests/im2gps3k_test.parquet").set_index("image_id")
-    regions = pd.read_parquet(ROOT / "data/processed/regions/E2_im2gps3k_sam.parquet")
-    redactions = pd.read_parquet(ROOT / "data/processed/redactions/E2_im2gps3k_v2.parquet")
-    dynamic_selections = _load_dynamic_selections(
-        ROOT / "data/processed/predictions/geoclip/E2_im2gps3k_redacted_v2__dynamic.jsonl"
-    )
+    regions = pd.read_parquet(REGIONS_PATH)
+    redactions = pd.read_parquet(REDACTIONS_PATH)
+    dynamic_selections = _load_dynamic_selections(DYNAMIC_JSONL_PATH)
+    print(f"variant={_VARIANT}: {len(regions)} regions, "
+          f"{len(redactions)} redaction rows, "
+          f"{len(dynamic_selections)} dynamic selections")
 
     # Pull baseline GeoCLIP predictions (E1) so we can render orig lat/lon.
     e1_path = ROOT / "data/processed/predictions/geoclip/E1_im2gps3k.jsonl"
