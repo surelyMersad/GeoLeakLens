@@ -180,10 +180,14 @@ def _build_conditional_set(
     print(f"[e2] conditional set: {len(sub)}/{len(manifest)} images "
           f"with baseline error ≤ {threshold_km} km")
     if max_images and len(sub) > max_images:
+        # Use a single permutation and take the first max_images indices, so
+        # the sample is *nested* across max_images values — n=30 ⊂ n=100 ⊂
+        # n=500 with the same seed. Important for cache reuse on scale-up
+        # runs and for "is this image already in the smaller set?" auditing.
         rng = np.random.default_rng(seed)
-        idx = rng.choice(len(sub), size=max_images, replace=False)
-        sub = sub.iloc[sorted(idx)].reset_index(drop=True)
-        print(f"[e2] subsampled to {len(sub)} images (seed={seed})")
+        order = rng.permutation(len(sub))[:max_images]
+        sub = sub.iloc[sorted(order)].reset_index(drop=True)
+        print(f"[e2] subsampled to {len(sub)} images (seed={seed}, nested)")
     return sub
 
 
@@ -259,13 +263,24 @@ def _run_attribution_phase(
 ) -> pd.DataFrame:
     """Per-region single-attribution scores under each requested intervention.
 
-    Emits one row of the §7.5 schema per (image, region, intervention). The
-    caller can stitch in §10.7 `min_across` rows by passing the result through
-    `min_across_interventions(...)` once this phase completes.
+    Emits one row of the §7.5 schema per (image, region, intervention).
+    Caller can stitch §10.7 `min_across` rows in via `min_across_interventions(...)`.
 
-    `lama_modal` is required if `"inpaint"` is in `intervention_types` — the
-    inpaint wrapper sends `image_bytes` over the Modal boundary. mean_mask /
-    blur run locally with just NumPy/Pillow.
+    Concurrency
+    -----------
+    The per-image inner loop is fully batched:
+
+      1. mean_mask / blur are local NumPy ops; produce all trial PIL images
+         in memory.
+      2. inpaint trial images are batched through `lama.inpaint.starmap(...)`
+         so all K LaMa calls per image fan out across Modal containers.
+      3. All K * |interventions| edited bytes are then batched through
+         `geoclip.predict.map(...)` for parallel GeoCLIP scoring.
+
+    For the n=100 / region_cap=15 / 3 interventions / image set, sequential
+    scoring took ~5+ hours; the batched path cuts that to ~30-45 min.
+
+    `lama_modal` is required if `"inpaint"` is in `intervention_types`.
     """
     pred_jsonl.parent.mkdir(parents=True, exist_ok=True)
     if "inpaint" in intervention_types and lama_modal is None:
@@ -291,59 +306,141 @@ def _run_attribution_phase(
             orig_lat = orig_parsed["parsed"].get("lat")
             orig_lon = orig_parsed["parsed"].get("lon")
             pil = Image.open(io.BytesIO(img_bytes)).convert("RGB")
+            w, h = pil.size
 
-            # Cap to top-K regions by area so total cost stays bounded —
-            # without this, 80 regions × 3 interventions × 30 images is
-            # 7200 GeoCLIP calls (~2 hours on L4).
             picked = sub.sort_values("area_frac", ascending=False).head(region_cap)
 
+            # Phase A: load all the masks for this image once.
+            region_records = []
             for _, r in picked.iterrows():
-                mask = _load_mask_npz(Path(r["mask_path"]))
+                try:
+                    mask = _load_mask_npz(Path(r["mask_path"]))
+                except Exception as e:
+                    print(f"[attr-skip-mask] {r['region_id']}: {e}")
+                    continue
+                if mask.shape != (h, w):
+                    continue
+                region_records.append((r, mask))
+            if not region_records:
+                continue
+
+            # Phase B: inpaint trial images, batched via LaMa `.starmap()`.
+            # Build (img_bytes, mask_png_bytes) pairs once, fan out, collect
+            # in input order. Local mean_mask / blur trials happen in-process.
+            need_inpaint = "inpaint" in intervention_types
+            inpaint_results: list[Optional[bytes]] = []
+            if need_inpaint:
+                from geoleaklens.interventions.mask import dilate_mask
+                inpaint_inputs: list[tuple[bytes, bytes]] = []
+                for _, mask in region_records:
+                    applied = dilate_mask(mask.astype(bool), 7)
+                    img_buf = io.BytesIO()
+                    pil.save(img_buf, format="JPEG", quality=92)
+                    mask_pil = Image.fromarray(
+                        (applied.astype(np.uint8) * 255), mode="L"
+                    )
+                    mask_buf = io.BytesIO()
+                    mask_pil.save(mask_buf, format="PNG")
+                    inpaint_inputs.append(
+                        (img_buf.getvalue(), mask_buf.getvalue())
+                    )
+                try:
+                    raw_inpaints = list(lama_modal.inpaint.starmap(inpaint_inputs))
+                    inpaint_results = list(raw_inpaints)
+                except Exception as e:
+                    print(f"[attr-skip-lama-batch] {image_id}: {e}")
+                    inpaint_results = [None] * len(region_records)
+
+            # Phase C: build all (region, intervention) edited PIL images.
+            #   Build trial bytes for batched GeoCLIP scoring; remember the
+            #   (region_id, intervention) keying so we can re-thread the
+            #   batched results back to score rows.
+            trial_jobs: list[tuple[str, str, bytes]] = []  # (region_id, intervention, jpeg_bytes)
+            for ridx, (r, mask) in enumerate(region_records):
                 for intervention_type in intervention_types:
                     try:
-                        edited = _apply_intervention(
-                            intervention_type, pil, mask, lama_modal=lama_modal
-                        )
+                        if intervention_type == "mean_mask":
+                            edited, _ = mean_mask(pil, mask, mode="local")
+                        elif intervention_type == "blur":
+                            edited, _ = blur(pil, mask)
+                        elif intervention_type == "inpaint":
+                            inpainted_bytes = (
+                                inpaint_results[ridx]
+                                if ridx < len(inpaint_results)
+                                else None
+                            )
+                            if inpainted_bytes is None:
+                                continue
+                            edited = Image.open(
+                                io.BytesIO(inpainted_bytes)
+                            ).convert("RGB")
+                            if edited.size != pil.size:
+                                edited = edited.crop((0, 0, pil.size[0], pil.size[1]))
+                        else:
+                            continue
                     except Exception as e:
-                        # Don't kill the whole run for one bad region/intervention.
-                        # The §10.4 spec already calls inpaint failure-prone.
                         print(
-                            f"[attr-skip] {r['region_id']} / {intervention_type}: "
-                            f"{type(e).__name__}: {e}"
+                            f"[attr-skip] {r['region_id']} / "
+                            f"{intervention_type}: {type(e).__name__}: {e}"
                         )
                         continue
                     buf = io.BytesIO()
                     edited.save(buf, format="JPEG", quality=92)
-                    edit_pred = geoclip.predict.remote(buf.getvalue())
-                    edit_parsed = parse_geolocation_response(edit_pred)
-                    pred_fp.write(json.dumps({
-                        "image_id": image_id,
-                        "image_variant_id": f"{r['region_id']}__{intervention_type}",
-                        "model_name": "geoclip",
-                        "intervention_type": intervention_type,
-                        "raw_response": edit_parsed["raw_response"],
-                        "parsed": edit_parsed["parsed"],
-                        "parse_success": edit_parsed["parse_success"],
-                        "created_at": _now_iso(),
-                    }) + "\n")
-                    pred_fp.flush()
-                    score_rows.append(single_region_attribution(
-                        image_id=image_id,
-                        region_id=r["region_id"],
-                        model_name="geoclip",
-                        intervention_type=intervention_type,
-                        threshold_km=threshold_km,
-                        true_lat=true_lat,
-                        true_lon=true_lon,
-                        orig_lat=orig_lat, orig_lon=orig_lon,
-                        edit_lat=edit_parsed["parsed"].get("lat"),
-                        edit_lon=edit_parsed["parsed"].get("lon"),
-                        area_frac=float(r["area_frac"]),
-                        method="static_greedy",
-                    ))
+                    trial_jobs.append(
+                        (r["region_id"], intervention_type, buf.getvalue())
+                    )
+
+            # Phase D: batched GeoCLIP scoring of all trials for this image.
+            if not trial_jobs:
+                print(f"[attribution] {image_id}: no trials produced ({i+1}/{len(df)})")
+                continue
+            bytes_list = [job[2] for job in trial_jobs]
+            try:
+                if len(bytes_list) == 1:
+                    raw_results = [geoclip.predict.remote(bytes_list[0])]
+                else:
+                    raw_results = list(geoclip.predict.map(bytes_list))
+            except Exception as e:
+                print(f"[attr-skip-geoclip-batch] {image_id}: {e}")
+                continue
+
+            for (region_id, intervention_type, _), edit_pred in zip(
+                trial_jobs, raw_results
+            ):
+                edit_parsed = parse_geolocation_response(edit_pred)
+                pred_fp.write(json.dumps({
+                    "image_id": image_id,
+                    "image_variant_id": f"{region_id}__{intervention_type}",
+                    "model_name": "geoclip",
+                    "intervention_type": intervention_type,
+                    "raw_response": edit_parsed["raw_response"],
+                    "parsed": edit_parsed["parsed"],
+                    "parse_success": edit_parsed["parse_success"],
+                    "created_at": _now_iso(),
+                }) + "\n")
+                pred_fp.flush()
+                # Look up area_frac for this region.
+                area_frac = float(
+                    picked.loc[picked["region_id"] == region_id, "area_frac"].iloc[0]
+                )
+                score_rows.append(single_region_attribution(
+                    image_id=image_id,
+                    region_id=region_id,
+                    model_name="geoclip",
+                    intervention_type=intervention_type,
+                    threshold_km=threshold_km,
+                    true_lat=true_lat,
+                    true_lon=true_lon,
+                    orig_lat=orig_lat, orig_lon=orig_lon,
+                    edit_lat=edit_parsed["parsed"].get("lat"),
+                    edit_lon=edit_parsed["parsed"].get("lon"),
+                    area_frac=area_frac,
+                    method="static_greedy",
+                ))
             print(
-                f"[attribution] {image_id}: {len(picked)} regions × "
-                f"{len(intervention_types)} interventions ({i+1}/{len(df)})"
+                f"[attribution] {image_id}: {len(region_records)} regions × "
+                f"{len(intervention_types)} interventions, "
+                f"{len(trial_jobs)} GeoCLIP-batched ({i+1}/{len(df)})"
             )
     finally:
         pred_fp.close()
